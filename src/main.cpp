@@ -16,13 +16,19 @@
 
 // --- CONFIGURATION ---
 #define SLEEP_INTERVAL_SECONDS 6      // Time to sleep between checks
-#define DIFFERENCE_THRESHOLD 5        // Percentage of pixels that need to change to trigger a save (1-100)
+#define MINIMUM_THRESHOLD 15           // Minimum percentage change to trigger, to avoid triggers on very low noise
 #define COMPARISON_FRAME_SIZE FRAMESIZE_QQVGA // Low-res for faster comparison
 #define CAPTURE_FRAME_SIZE FRAMESIZE_XGA       // High-res for saving
+#define ENABLE_LED_FLASH false // flash LED?
+#define DEBUG_SAVE_RAW_IMAGES false // Set to true to save the two comparison images
+
+const char* NEW_IMG_PATH = "/new_img.raw";
 
 // --- PIN DEFINITIONS ---
-// The flash LED is on GPIO 4
-#define FLASH_LED_PIN 4
+// On the AI-THINKER board, GPIO 4 is used by the SD card.
+// To avoid conflicts, we will use a different GPIO for the flash LED.
+// Pin 4 would normally work
+#define FLASH_LED_PIN 33
 
 // Select camera model
 //#define CAMERA_MODEL_WROVER_KIT
@@ -36,14 +42,19 @@
 // --- PERSISTENT DATA (survives deep sleep) ---
 RTC_DATA_ATTR int bootCount = 0;
 RTC_DATA_ATTR int pictureNumber = 0;
+// History of the last 10 image differences to calculate a moving average
+const int DIFF_HISTORY_SIZE = 10;
+RTC_DATA_ATTR int diff_history[DIFF_HISTORY_SIZE] = {0};
+RTC_DATA_ATTR int diff_history_index = 0;
+RTC_DATA_ATTR int diff_history_count = 0;
 
 // --- CONSTANTS ---
 const char* REF_IMG_PATH = "/ref_img.raw";
 
 bool setup_camera(framesize_t frameSize);
 void save_picture(camera_fb_t *fb);
-int compare_images(camera_fb_t *fb1, uint8_t *fb2_buf);
-bool update_reference_image(camera_fb_t *fb);
+int compare_images(const camera_fb_t *fb1, const uint8_t *fb2_buf);
+bool update_reference_image(const camera_fb_t *fb, const char* path = REF_IMG_PATH);
 bool read_reference_image(uint8_t *buf, size_t len);
 
 void setup() {
@@ -57,7 +68,8 @@ void setup() {
   digitalWrite(FLASH_LED_PIN, LOW);
 
   // Initialize SD card on every boot
-  if (!SD_MMC.begin()) {
+  // Use 4-bit mode to avoid conflicts with the flash LED on GPIO 4
+  if (!SD_MMC.begin("/sdcard", false, true)) {
     Serial.println("SD Card Mount Failed. Going to sleep.");
     esp_deep_sleep_start();
     return;
@@ -108,24 +120,53 @@ void setup() {
       camera_fb_t *fb = esp_camera_fb_get();
       // Read the previous reference image from the SD card
       if (fb && read_reference_image(ref_buf, fb->len)) {
+        // --- DEBUG: Save the two images being compared ---
+        if (DEBUG_SAVE_RAW_IMAGES) {
+          // The reference image is already on the SD card as /ref_img.raw
+          // We just need to save the new one for comparison.
+          update_reference_image(fb, NEW_IMG_PATH);
+        }
         int diff = compare_images(fb, ref_buf);
         Serial.printf("Image difference: %d%%.\n", diff);
 
-        // The new reference image should be the one we just captured for comparison.
-        // Update it *before* de-initializing the camera or taking another picture.
-        update_reference_image(fb);
+        // --- DYNAMIC THRESHOLD CALCULATION ---
+        // Add current difference to our history for the moving average
+        diff_history[diff_history_index] = diff;
+        diff_history_index = (diff_history_index + 1) % DIFF_HISTORY_SIZE;
+        if (diff_history_count < DIFF_HISTORY_SIZE) {
+          diff_history_count++;
+        }
 
-        if (diff > DIFFERENCE_THRESHOLD) {
+        // Calculate the moving average
+        float moving_average = 0;
+        for (int i = 0; i < diff_history_count; i++) {
+          moving_average += diff_history[i];
+        }
+        if (diff_history_count > 0) {
+            moving_average /= diff_history_count;
+        }
+
+        // Dynamic threshold is 10% above the moving average, with a minimum value
+        int dynamic_threshold = (int)(moving_average * 1.10);
+        dynamic_threshold = max(dynamic_threshold, MINIMUM_THRESHOLD);
+        Serial.printf("Moving average: %.2f%%, Dynamic threshold: %d%%\n", moving_average, dynamic_threshold);
+
+        if (diff > dynamic_threshold) {
           Serial.println("Motion detected! Capturing high-res image.");
           esp_camera_deinit(); // De-init low-res camera
           if (setup_camera(CAPTURE_FRAME_SIZE)) {
             // Flash on
-            digitalWrite(FLASH_LED_PIN, HIGH);
-            // Add a longer delay to allow the sensor to adjust to the flash
-            delay(1200); 
+            if (ENABLE_LED_FLASH)
+                digitalWrite(FLASH_LED_PIN, HIGH);
+
+            // Allow the camera sensor to stabilize by capturing and discarding a few frames.
+            // This gives the auto-exposure and auto-white-balance algorithms time to adjust.
+            for (int i=0; i<2; i++) {
+                camera_fb_t *burn_fb = esp_camera_fb_get();
+                esp_camera_fb_return(burn_fb);
+            }
 
             camera_fb_t *fb_high = esp_camera_fb_get();
-            digitalWrite(FLASH_LED_PIN, LOW);
 
             if (fb_high) {
               save_picture(fb_high);
@@ -133,17 +174,23 @@ void setup() {
             } else {
               Serial.println("Failed to capture high-res image.");
             }
+
+            if (ENABLE_LED_FLASH)
+                digitalWrite(FLASH_LED_PIN, LOW);
           }
         } else {
           Serial.println("No significant motion detected.");
+          // Update the reference image only when the scene is static.
+          // This prevents a second photo when the scene returns to normal.
+          update_reference_image(fb);
         }
         esp_camera_fb_return(fb);
       } else {
         Serial.println("Failed to capture comparison frame.");
       }
+      free(ref_buf); // Free the memory after all camera operations are done.
       esp_camera_deinit();
     }
-    free(ref_buf); // Free the memory
   }
 
   Serial.printf("Going to sleep for %d seconds...\n\n", SLEEP_INTERVAL_SECONDS);
@@ -208,6 +255,10 @@ bool setup_camera(framesize_t frameSize) {
   // These settings help improve color balance and exposure.
   s->set_whitebal(s, 1);       // 1 = enable automatic white balance
   s->set_awb_gain(s, 1);       // 1 = enable AWB gain
+  // Set the LED flash pin in the camera driver
+  // This is important if you use a pin other than the default GPIO 4
+  s->set_reg(s, 0x00, s->get_reg(s, 0x00, 0xff) | 0x04, 0x04); // REG00
+  s->set_reg(s, 0x11, (s->get_reg(s, 0x11, 0xff) & 0xBF) | (0x1 << 6), 0x40); // CLKRC, set bit 6 to 1
   s->set_exposure_ctrl(s, 1);  // 1 = enable automatic exposure control
   s->set_aec2(s, 1);           // 1 = enable automatic exposure correction
 
@@ -233,18 +284,18 @@ void save_picture(camera_fb_t *fb) {
   file.close();
 }
 
-bool update_reference_image(camera_fb_t *fb) {
-  File file = SD_MMC.open(REF_IMG_PATH, FILE_WRITE);
+bool update_reference_image(const camera_fb_t *fb, const char* path) {
+  File file = SD_MMC.open(path, FILE_WRITE);
   if (!file) {
-    Serial.println("Failed to open reference image for writing");
+    Serial.printf("Failed to open %s for writing\n", path);
     return false;
   }
   if (file.write(fb->buf, fb->len) != fb->len) {
-    Serial.println("Failed to write reference image");
+    Serial.printf("Failed to write to %s\n", path);
     file.close();
     return false;
   }
-  Serial.printf("Reference image updated on SD card (%d bytes).\n", fb->len);
+  Serial.printf("Image saved to %s (%d bytes).\n", path, fb->len);
   file.close();
   return true;
 }
@@ -264,8 +315,9 @@ bool read_reference_image(uint8_t *buf, size_t len) {
   return true;
 }
 
-int compare_images(camera_fb_t *fb1, uint8_t *fb2_buf) {
+int compare_images(const camera_fb_t *fb1, const uint8_t *fb2_buf) {
   if (!fb1 || !fb2_buf) {
+    // This can happen if the reference image file doesn't exist yet
     Serial.println("Cannot compare NULL frames");
     return 101; // Return a value > 100 to indicate error
   }
