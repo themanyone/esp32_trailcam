@@ -55,7 +55,7 @@ This project is built using PlatformIO with Visual Studio Code.
 
 - Clone this repository to your local machine:
   ```bash
-  git clone <your-repository-url>
+  git clone https://github.com/themanyone/esp32_trailcam
   ```
 - Open the cloned project folder in VS Code. PlatformIO should automatically recognize it.
 
