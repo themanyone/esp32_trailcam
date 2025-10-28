@@ -14,6 +14,7 @@ This project turns an ESP32-CAM development board into a low-power, motion-activ
 
 - **Time and Date** Clock is reset each time the device goes to sleep, but RTC clock board could be added.
 - **Web Server** A web server could be added to let you view stored images over wifi.
+- **Disable LED** Disabling the LED requires [hardware modification](https://www.youtube.com/watch?v=loet1ndG8Sg). Or you can cover it up.
 
 ## How It Works
 
